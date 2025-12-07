@@ -352,13 +352,8 @@ async def cmd_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(summary)
 
 
-def main():
-    application = (
-        ApplicationBuilder()
-            .token(TELEGRAM_TOKEN)
-            .updater(None)  # Avoid Updater instantiation issues on some runtimes
-            .build()
-    )
+async def main():
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("rules", cmd_rules))
@@ -369,8 +364,11 @@ def main():
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_answer))
 
     logger.info("Bot starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
