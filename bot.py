@@ -1,299 +1,250 @@
-import logging
 import asyncio
+import logging
 import os
-from telegram import Update
+import random
+from dataclasses import dataclass, field
+from datetime import datetime
+
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
+    ApplicationBuilder,
     Application,
     CommandHandler,
     MessageHandler,
-    filters,
+    CallbackQueryHandler,
     ContextTypes,
-    ConversationHandler,
+    filters,
 )
+
 import google.generativeai as genai
 
-# ==========================================
-# НАСТРОЙКИ
-# ==========================================
-# Чтение токенов из переменных окружения (обязательно для Render)
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН_TELEGRAM")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "ВСТАВЬ_СЮДА_API_KEY_GEMINI")
-
-# ==========================================
-# ЛОГИКА ИИ
-# ==========================================
-
-# Dummy Model для обработки ошибок или отсутствия ключа
-class DummyModel:
-    """Заглушка, если API ключ Gemini отсутствует или невалиден."""
-    def generate_content(self, prompt):
-        # Возвращает объект, имитирующий ответ Gemini
-        return type('Response', (object,), {'text': "Ошибка ИИ: Проверьте ключ Gemini/интернет. Резервный вопрос: Как ты себя чувствуешь?"})()
-
-# Настройка Gemini
-model = None
-if GEMINI_API_KEY and GEMINI_API_KEY != "ВСТАВЬ_СЮДА_API_KEY_GEMINI":
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        # Используем gemini-2.5-flash для более быстрого и дешевого ответа
-        model = genai.GenerativeModel('gemini-2.5-flash') 
-    except Exception as e:
-        logging.error(f"Failed to configure Gemini API: {e}. Using Dummy Model.")
-        model = DummyModel()
-else:
-    logging.warning("GEMINI_API_KEY is missing or using placeholder. AI functionality will be limited. Using Dummy Model.")
-    model = DummyModel()
-
-SYSTEM_PROMPT = (
-    "Ты — ведущий эротической игры для пары. Твоя задача — генерировать вопросы и задания."
-    "Правила:"
-    "1. Есть 3 уровня: 1 (легкий флирт), 2 (средний, возбуждение), 3 (очень горячо)."
-    "2. СТРОГИЕ ЗАПРЕТЫ: Никаких упоминаний бывших. Никакого анала. Это табу."
-    "3. Вопросы должны подразумевать ответ 'Да', 'Нет', одно слово или присылку фото/видео."
-    "4. Учитывай контекст: если игроки отвечают 'Да', повышай градус."
-    "5. Будь кратким. Не пиши вступлений, сразу вопрос."
+# --- Настройки логов ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
+logger = logging.getLogger(__name__)
 
-async def get_ai_question(level, history_summary, player_name):
-    """Генерирует вопрос через ИИ."""
-    prompt = (
-        f"{SYSTEM_PROMPT}\n"
-        f"Текущий уровень: {level}.\n"
-        f"Сейчас ход игрока по имени: {player_name}.\n"
-        f"Краткая история игры: {history_summary}\n"
-        f"Придумай 1 задание или вопрос для {player_name}."
+# --- Конфигурация API ---
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN is not set in environment")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is not set in environment")
+
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+
+ANSWER_TIMEOUT = 60
+MAX_LEVEL = 3
+MIN_LEVEL = 1
+
+# --- Классы данных ---
+@dataclass
+class QAItem:
+    player_name: str
+    level: int
+    question: str
+    answer: str | None = None
+    skipped: bool = False
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
+class GameSession:
+    chat_id: int
+    player1: str | None = None
+    player2: str | None = None
+    current_player_index: int = 0
+    level: int = 1
+    history: list[QAItem] = field(default_factory=list)
+    skips_left: int = 1
+    waiting_for_answer: bool = False
+    last_question_id: int | None = None
+
+
+SESSIONS: dict[int, GameSession] = {}
+
+# --- Вспомогательные функции ---
+def get_session(chat_id: int) -> GameSession:
+    if chat_id not in SESSIONS:
+        SESSIONS[chat_id] = GameSession(chat_id=chat_id)
+    return SESSIONS[chat_id]
+
+
+def current_player_name(session: GameSession) -> str:
+    return [session.player1, session.player2][session.current_player_index]
+
+
+def next_player(session: GameSession) -> None:
+    session.current_player_index = 1 - session.current_player_index
+
+
+def is_short_answer(text: str | None) -> bool:
+    if not text:
+        return True
+    return len(text.strip().split()) <= 3
+
+
+# --- Генерация вопросов ---
+async def generate_question_ru(level: int, session: GameSession, last_answer: str | None):
+    history_text = "\n".join(
+        f"{i.player_name}: {i.question} → {i.answer or 'нет ответа'}" for i in session.history[-6:]
     )
-    try:
-        # Устанавливаем таймаут на всякий случай
-        response = await asyncio.wait_for(
-            asyncio.to_thread(model.generate_content, prompt), 
-            timeout=15.0
-        )
-        return response.text.strip()
-    except (asyncio.TimeoutError, Exception) as e:
-        logging.error(f"AI Error during question generation: {e}")
-        return "Расскажи часть тела партнера, которая тебе нравится больше всего. (Ошибка ИИ, резервный вопрос)"
+    prompt = f"""
+Ты — ведущий игры для пары. Язык — русский.
+Формат:
+- ответы «да», «нет», одно слово или медиа
+- 3 уровня (1 — лёгкий, 2 — средний, 3 — горячий)
+- без бывших и анала
 
-async def get_ai_summary(history_full):
-    """Генерирует резюме игры."""
-    prompt = (
-        f"{SYSTEM_PROMPT}\n"
-        "Игра окончена. Проанализируй ответы пары и составь психологический и сексуальный портрет их совместимости на основе этой игры."
-        "Дай советы, что им попробовать в постели. Будь позитивным и игривым."
-        f"История игры:\n{history_full}"
+История: {history_text or 'нет'}
+Последний ответ: {last_answer or 'нет'}
+Сделай новый короткий вопрос для уровня {level}.
+"""
+    try:
+        resp = await asyncio.to_thread(gemini_model.generate_content, prompt)
+        text = resp.text.strip()
+        if text.startswith("1.") or text.startswith("1)"):
+            text = text[2:].strip()
+        return text
+    except Exception:
+        fallback = {
+            1: "Какое ласковое слово тебе нравится больше всего?",
+            2: "Ты бы хотел чаще говорить о своих желаниях?",
+            3: "Что самое смелое ты бы сделал ради партнёра?",
+        }
+        return fallback[level]
+
+
+# --- Генерация итогов ---
+async def generate_summary_ru(session: GameSession):
+    history_text = "\n".join(
+        f"{i.player_name}: {i.question} → {i.answer or 'нет ответа'}" for i in session.history
     )
+    prompt = f"""
+Сделай короткое резюме игры двух людей ({session.player1} и {session.player2})
+по их ответам:
+{history_text}
+
+1. Дай тёплое заключение (2–3 предложения)
+2. Дай 3 коротких совета улучшения отношений
+3. Без морали и без упоминания бывших
+"""
     try:
-        # Устанавливаем таймаут
-        response = await asyncio.wait_for(
-            asyncio.to_thread(model.generate_content, prompt), 
-            timeout=30.0
-        )
-        return response.text.strip()
-    except (asyncio.TimeoutError, Exception) as e:
-        logging.error(f"AI Error during summary generation: {e}")
-        return "Вы отлично провели время! (Ошибка генерации резюме)"
+        resp = await asyncio.to_thread(gemini_model.generate_content, prompt)
+        return resp.text.strip()
+    except Exception:
+        return "Игра завершена! Вы отлично справились ❤️"
 
-# ==========================================
-# ЛОГИКА БОТА
-# ==========================================
 
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
-
-# Состояния
-REGISTER, GAME_LOOP, WAITING_FOR_ANSWER = range(3)
-
+# --- Команды ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    session = get_session(chat_id)
+    session.history.clear()
+    session.level = 1
+    session.skips_left = 1
     await update.message.reply_text(
-        "🔥 **Привет! Я ИИ-бот для пар @love4two.**\n\n"
-        "Правила:\n"
-        "- Таймер 60 сек.\n"
-        "- 3 уровня пикантности.\n"
-        "- ИИ подстраивается под вас.\n"
-        "- В конце я выдам резюме вашей пары.\n\n"
-        "Введите имя **первого игрока**:",
-        parse_mode="Markdown"
+        "🔥 Love4Two — игра для пары.\nНапиши имя первого игрока:"
     )
-    context.user_data['players'] = []
-    context.user_data['history'] = [] # Для полного лога
-    context.user_data['history_summary'] = "" # Для контекста вопросов
-    return REGISTER
+    context.user_data["awaiting_name1"] = True
 
-async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text
-    context.user_data['players'].append({'name': name, 'skips': 1, 'id': update.effective_user.id})
-    
-    if len(context.user_data['players']) == 1:
-        await update.message.reply_text("Супер. Введите имя **второго игрока**:")
-        return REGISTER
-    else:
-        p1 = context.user_data['players'][0]['name']
-        p2 = context.user_data['players'][1]['name']
-        await update.message.reply_text(
-            f"Игроки {p1} и {p2} в игре!\n"
-            "Начинаем с Уровня 1.\n"
-            "Нажмите /question, чтобы ИИ сгенерировал первый вопрос."
-        )
-        context.user_data['level'] = 1
-        context.user_data['turn'] = 0
-        return GAME_LOOP
 
-async def ask_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    players = context.user_data.get('players')
-    if not players:
-        await update.message.reply_text("Нажмите /start")
-        return ConversationHandler.END
+async def ask_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    session = get_session(chat_id)
+    name = update.message.text.strip()
 
-    # Проверка, что спрашивает игрок, чей сейчас ход (для безопасности)
-    turn = context.user_data['turn']
-    current_player = players[turn]
-    
-    # Можно добавить проверку: if update.effective_user.id != current_player['id'] and len(players) == 2:
-    #     await update.message.reply_text(f"Сейчас ход игрока {current_player['name']}!")
-    #     return GAME_LOOP 
-
-    level = context.user_data['level']
-    history_summary = context.user_data.get('history_summary', '')
-
-    # Индикация загрузки (так как ИИ думает пару секунд)
-    msg = await update.message.reply_text("🧠 *ИИ придумывает вопрос...*", parse_mode="Markdown")
-
-    # Генерация вопроса
-    question = await get_ai_question(level, history_summary, current_player['name'])
-    
-    # Удаляем сообщение о загрузке и пишем вопрос
-    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
-    
-    await update.message.reply_text(
-        f"🎲 **Ход: {current_player['name']}** (Уровень {level})\n\n"
-        f"{question}\n\n"
-        f"⏳ 60 секунд! (Ответ: текст, фото, видео или /skip)",
-        parse_mode="Markdown"
-    )
-    
-    # Сохраняем вопрос в контекст
-    context.user_data['current_question'] = question
-
-    # Таймер
-    chat_id = update.effective_message.chat_id
-    context.job_queue.run_once(alarm, 60, chat_id=chat_id, name=str(chat_id), data={'player': current_player['name']})
-    
-    return WAITING_FOR_ANSWER
-
-async def alarm(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    await context.bot.send_message(job.chat_id, text=f"⏰ ВРЕМЯ ВЫШЛО! {job.data['player']}, ты наказан(а)! Целуй партнера куда он скажет. Жми /question дальше.")
-
-async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Убираем таймер
-    jobs = context.job_queue.get_jobs_by_name(str(update.effective_message.chat_id))
-    for job in jobs:
-        job.schedule_removal()
-
-    # Проверка, что отвечает игрок, чей сейчас ход
-    players = context.user_data.get('players', [])
-    if not players:
-        await update.message.reply_text("Игра не начата. Нажмите /start")
-        return ConversationHandler.END
-        
-    turn = context.user_data['turn']
-    current_player_id = players[turn]['id']
-    
-    # Если отвечает не тот игрок
-    if update.effective_user.id != current_player_id and len(players) == 2:
-        await update.message.reply_text(f"Подожди! Сейчас отвечает {players[turn]['name']}.")
-        return WAITING_FOR_ANSWER # Ждем ответа от нужного игрока
-
-    user_text = update.message.text if update.message.text else "[МЕДИА ФАЙЛ]"
-    
-    # Обработка /skip
-    if user_text == '/skip':
-        if players[turn]['skips'] > 0:
-            players[turn]['skips'] -= 1
-            await update.message.reply_text(f"Пропуск принят. Осталось пропусков: {players[turn]['skips']}. Жми /question.")
-        else:
-            await update.message.reply_text("Пропуски кончились! Отвечай или выполняй наказание. Жми /question.")
-        
-        # Переход хода
-        context.user_data['turn'] = 1 - context.user_data['turn']
-        return GAME_LOOP
-
-    # Логика уровней
-    if user_text.lower() in ['да', 'yes', 'хочу', 'конечно']:
-        # Повышаем уровень после "да"
-        if context.user_data['level'] < 3:
-             context.user_data['level'] += 1
-             await update.message.reply_text("🔥 Ого! Ответ 'Да' повышает градус! Следующий вопрос будет горячее.")
-
-    # Сохраняем историю для ИИ
-    player_name = players[turn]['name']
-    question = context.user_data.get('current_question', 'Вопрос')
-    
-    entry = f"Вопрос к {player_name}: {question}. Ответ: {user_text}."
-    context.user_data['history'].append(entry)
-    # Держим краткую историю (последние 3 хода) для генерации вопросов
-    context.user_data['history_summary'] += f" {entry}"
-    if len(context.user_data['history_summary']) > 500:
-        context.user_data['history_summary'] = context.user_data['history_summary'][-500:]
-
-    await update.message.reply_text("Принято! 😏 Жми /question для следующего хода.\nИли /stop чтобы закончить и получить резюме.")
-    
-    # Переход хода
-    context.user_data['turn'] = 1 - context.user_data['turn']
-    return GAME_LOOP
-
-async def stop_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Генерация финального отчета."""
-    # Удаляем все активные таймеры перед завершением
-    jobs = context.job_queue.get_jobs_by_name(str(update.effective_message.chat_id))
-    for job in jobs:
-        job.schedule_removal()
-        
-    history = "\n".join(context.user_data.get('history', []))
-    if not history:
-        await update.message.reply_text("Вы толком не играли :( Начните заново /start")
-        return ConversationHandler.END
-        
-    msg = await update.message.reply_text("🏁 Игра окончена! ИИ анализирует вашу химию... (подождите пару секунд)", parse_mode="Markdown")
-    
-    summary = await get_ai_summary(history)
-    
-    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
-    await update.message.reply_text(f"📋 **РЕЗЮМЕ ПАРЫ**:\n\n{summary}", parse_mode="Markdown")
-    
-    return ConversationHandler.END
-
-# Настройка приложения
-def main():
-    # Проверяем токен
-    if (TELEGRAM_TOKEN == "ВСТАВЬ_СЮДА_ТОКЕН_TELEGRAM" and not os.environ.get("TELEGRAM_TOKEN")):
-        print("ОШИБКА: Вы не вставили токен бота в файл или не установили его в переменные окружения! Бот не запустится.")
+    if context.user_data.get("awaiting_name1"):
+        session.player1 = name
+        context.user_data["awaiting_name1"] = False
+        context.user_data["awaiting_name2"] = True
+        await update.message.reply_text("Теперь имя второго игрока:")
         return
 
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    if context.user_data.get("awaiting_name2"):
+        session.player2 = name
+        context.user_data["awaiting_name2"] = False
+        await update.message.reply_text(
+            f"Отлично! {session.player1} и {session.player2}, давайте начнём.\nВведите /question."
+        )
 
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            REGISTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, register)],
-            GAME_LOOP: [
-                CommandHandler("question", ask_question),
-                CommandHandler("stop", stop_game) 
-            ],
-            WAITING_FOR_ANSWER: [
-                MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.VOICE, handle_answer),
-                CommandHandler("skip", handle_answer) 
-            ],
-        },
-        fallbacks=[CommandHandler("stop", stop_game)],
+
+async def cmd_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    session = get_session(chat_id)
+
+    if not session.player1 or not session.player2:
+        await update.message.reply_text("Сначала напишите имена через /start.")
+        return
+
+    if session.waiting_for_answer:
+        await update.message.reply_text("Сначала ответьте на предыдущий вопрос!")
+        return
+
+    last_answer = session.history[-1].answer if session.history else None
+    q = await generate_question_ru(session.level, session, last_answer)
+
+    player = current_player_name(session)
+    qa = QAItem(player_name=player, level=session.level, question=q)
+    session.history.append(qa)
+    session.waiting_for_answer = True
+    session.last_question_id = len(session.history) - 1
+
+    await update.message.reply_text(
+        f"🎯 Вопрос для *{player}* (уровень {session.level}):\n\n{q}",
+        parse_mode="Markdown",
     )
 
-    application.add_handler(conv_handler)
-    
-    # Запуск бота
-    print("Бот запущен. Ожидание обновлений...")
-    application.run_polling(poll_interval=1.0)
+
+async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    session = get_session(chat_id)
+
+    if context.user_data.get("awaiting_name1") or context.user_data.get("awaiting_name2"):
+        await ask_names(update, context)
+        return
+
+    if not session.waiting_for_answer:
+        await update.message.reply_text("Напиши /question для следующего вопроса.")
+        return
+
+    item = session.history[session.last_question_id]
+    text = update.message.text or "<media>"
+    if not is_short_answer(text):
+        await update.message.reply_text("Ответ должен быть коротким.")
+        return
+
+    item.answer = text.strip()
+    session.waiting_for_answer = False
+    next_player(session)
+    await update.message.reply_text("✅ Ответ принят. Введите /question для следующего.")
+
+
+async def cmd_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    session = get_session(chat_id)
+    summary = await generate_summary_ru(session)
+    await update.message.reply_text(summary)
+
+
+# --- Запуск ---
+async def main():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("question", cmd_question))
+    app.add_handler(CommandHandler("finish", cmd_finish))
+    app.add_handler(MessageHandler(filters.ALL, handle_answer))
+
+    logger.info("Bot starting...")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
-    # Логирование для отладки
-    logging.getLogger('google').setLevel(logging.WARNING)
-    main()
+    asyncio.run(main())
