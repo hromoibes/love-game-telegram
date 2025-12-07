@@ -26,8 +26,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Конфигурация API ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+TELEGRAM_TOKEN = os.environ.get("8077450473:AAGIu5JlTxBe6kRIiaA_oUIhsmJuMgzpOQ4")
+GEMINI_API_KEY = os.environ.get("AIzaSyBTTPIJXX0mR9gbEJIZwOHfDVqLnHDR6ew")
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set in environment")
@@ -248,3 +248,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
