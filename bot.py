@@ -9,6 +9,7 @@ from typing import Optional
 import google.generativeai as genai
 from telegram import Update
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
@@ -108,6 +109,12 @@ async def generate_question_ru(level: int, session: GameSession, last_answer: st
 - 3 уровня (1 — лёгкий, 2 — средний, 3 — горячий)
 - без бывших и анала
 
+История (последние 6):
+{history_text or 'пусто'}
+Последний ответ: {last_answer or 'нет'}
+Текущий уровень: {level}
+
+Сгенерируй один вопрос для следующего игрока. Должно быть вежливо, но живо. Без нумерации, без пояснений.
 История: {history_text or 'нет'}
 Последний ответ: {last_answer or 'нет'}
 Сделай новый короткий вопрос для уровня {level} и учитывай предыдущие ответы.
@@ -115,6 +122,17 @@ async def generate_question_ru(level: int, session: GameSession, last_answer: st
     try:
         resp = await asyncio.to_thread(_gemini_model.generate_content, prompt)
         text = resp.text.strip()
+        if text:
+            return text
+    except Exception as exc:  # pragma: no cover - сетевой код
+        logger.warning("Gemini question fallback because of %s", exc)
+
+    fallback = {
+        1: "Какое ласковое слово тебе нравится больше всего?",
+        2: "Что бы ты хотел чаще слышать или чувствовать от партнёра?",
+        3: "Какое самое смелое желание ты бы хотел выполнить вместе?",
+    }
+    return fallback[level]
         if text.startswith("1.") or text.startswith("1)"):
             text = text[2:].strip()
         return text
@@ -150,6 +168,8 @@ async def generate_summary_ru(session: GameSession):
 
 
 async def send_rules(update: Update):
+    if update.message is None:
+        return
     rules = (
         "🔥 Love4Two — правила:\n"
         "• Ответы: «да», «нет», одно слово или медиа.\n"
@@ -163,6 +183,21 @@ async def send_rules(update: Update):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    chat_id = update.effective_chat.id
+    session = get_session(chat_id)
+    session.reset()
+    context.chat_data["awaiting_name1"] = True
+    context.chat_data.pop("awaiting_name2", None)
+    await update.message.reply_text(
+        "🔥 Love4Two — игра для пары.\nНапиши имя первого игрока:"
+    )
+
+
+async def ask_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
     chat_id = update.effective_chat.id
     session = get_session(chat_id)
     session.reset()
@@ -177,6 +212,16 @@ async def ask_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(chat_id)
     name = (update.message.text or "").strip()
 
+    if context.chat_data.get("awaiting_name1"):
+        session.player1 = name or "Игрок 1"
+        context.chat_data["awaiting_name1"] = False
+        context.chat_data["awaiting_name2"] = True
+        await update.message.reply_text("Теперь имя второго игрока:")
+        return
+
+    if context.chat_data.get("awaiting_name2"):
+        session.player2 = name or "Игрок 2"
+        context.chat_data["awaiting_name2"] = False
     if context.user_data.get("awaiting_name1"):
         session.player1 = name
         context.user_data["awaiting_name1"] = False
@@ -193,6 +238,7 @@ async def ask_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _schedule_reminder(context: ContextTypes.DEFAULT_TYPE, session: GameSession) -> None:
+    if session.last_question_id is None or context.job_queue is None:
     if not context.job_queue or session.last_question_id is None:
         return
 
@@ -233,6 +279,8 @@ async def _reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
     chat_id = update.effective_chat.id
     session = get_session(chat_id)
 
@@ -261,6 +309,8 @@ async def cmd_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
     chat_id = update.effective_chat.id
     session = get_session(chat_id)
 
@@ -274,6 +324,7 @@ async def cmd_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("Укажите уровень числом 1-3.")
             return
+        session.level = max(MIN_LEVEL, min(MAX_LEVEL, new_level))
         new_level = max(MIN_LEVEL, min(MAX_LEVEL, new_level))
         session.level = new_level
         await update.message.reply_text(f"Текущий уровень: {session.level}.")
@@ -284,6 +335,8 @@ async def cmd_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
     chat_id = update.effective_chat.id
     session = get_session(chat_id)
 
@@ -308,6 +361,12 @@ async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    chat_id = update.effective_chat.id
+    session = get_session(chat_id)
+
+    if context.chat_data.get("awaiting_name1") or context.chat_data.get("awaiting_name2"):
     chat_id = update.effective_chat.id
     session = get_session(chat_id)
 
@@ -346,12 +405,16 @@ async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
     chat_id = update.effective_chat.id
     session = get_session(chat_id)
     summary = await generate_summary_ru(session)
     await update.message.reply_text(summary)
 
 
+def main() -> None:
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
 async def main():
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
@@ -364,6 +427,14 @@ async def main():
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_answer))
 
     logger.info("Bot starting...")
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
