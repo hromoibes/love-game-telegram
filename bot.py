@@ -13,7 +13,6 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
-    Updater as _Updater,
     filters,
 )
 
@@ -22,13 +21,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-# python-telegram-bot 20.8 + Python 3.13 bug workaround:
-# Updater.__slots__ misses _Updater__polling_cleanup_cb, so its __init__ would raise
-# AttributeError when ApplicationBuilder tries to instantiate the Updater. Extending
-# __slots__ keeps compatibility without relying on a patched library version.
-if hasattr(_Updater, "__slots__") and "_Updater__polling_cleanup_cb" not in _Updater.__slots__:
-    _Updater.__slots__ = tuple(_Updater.__slots__) + ("_Updater__polling_cleanup_cb",)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -360,13 +352,8 @@ async def cmd_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(summary)
 
 
-def main():
-    application = (
-        ApplicationBuilder()
-            .token(TELEGRAM_TOKEN)
-            .updater(None)  # Avoid Updater instantiation issues on some runtimes
-            .build()
-    )
+async def main():
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("rules", cmd_rules))
@@ -377,8 +364,11 @@ def main():
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_answer))
 
     logger.info("Bot starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
