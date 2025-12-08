@@ -1,445 +1,228 @@
-import asyncio
 import logging
-import os
-import random
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Optional
 
-import google.generativeai as genai
-from telegram import Update
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (CallbackQuery, InlineKeyboardButton,
+                           InlineKeyboardMarkup, Message, ReplyKeyboardMarkup,
+                           KeyboardButton)
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+from ai_client import AIClient
+from config import settings
+from game_engine import GameEngine, SessionManager
+from models import GameSession, IntimacyLevel
+
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN is not set in environment")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is not set in environment")
-
-ANSWER_TIMEOUT = 60
-MAX_LEVEL = 3
-MIN_LEVEL = 1
+bot = Bot(token=settings.telegram_token, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
+session_manager = SessionManager()
+ai_client = AIClient(api_key=settings.ai_api_key)
+game_engine = GameEngine(session_manager=session_manager)
 
 
-genai.configure(api_key=GEMINI_API_KEY)
-_gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+class SetupForm(StatesGroup):
+    waiting_names = State()
+    waiting_level = State()
+    waiting_length = State()
+    playing = State()
 
 
-@dataclass
-class QAItem:
-    player_name: str
-    level: int
-    question: str
-    answer: str | None = None
-    skipped: bool = False
-    created_at: datetime = field(default_factory=datetime.utcnow)
-
-
-@dataclass
-class GameSession:
-    chat_id: int
-    player1: str | None = None
-    player2: str | None = None
-    current_player_index: int = 0
-    level: int = 1
-    history: list[QAItem] = field(default_factory=list)
-    skips_left: list[int] = field(default_factory=lambda: [1, 1])
-    waiting_for_answer: bool = False
-    last_question_id: Optional[int] = None
-    reminder_job_name: Optional[str] = None
-
-    def reset(self) -> None:
-        self.player1 = None
-        self.player2 = None
-        self.current_player_index = 0
-        self.level = 1
-        self.history.clear()
-        self.skips_left = [1, 1]
-        self.waiting_for_answer = False
-        self.last_question_id = None
-        self.reminder_job_name = None
-
-
-SESSIONS: dict[int, GameSession] = {}
-
-
-def get_session(chat_id: int) -> GameSession:
-    if chat_id not in SESSIONS:
-        SESSIONS[chat_id] = GameSession(chat_id=chat_id)
-    return SESSIONS[chat_id]
-
-
-def current_player_name(session: GameSession) -> str:
-    return [session.player1, session.player2][session.current_player_index]
-
-
-def next_player(session: GameSession) -> None:
-    session.current_player_index = 1 - session.current_player_index
-
-
-def is_short_answer(text: str | None) -> bool:
-    if not text:
-        return True
-    return len(text.strip().split()) <= 3
-
-
-async def generate_question_ru(level: int, session: GameSession, last_answer: str | None):
-    history_text = "\n".join(
-        f"{i.player_name}: {i.question} → {i.answer or 'нет ответа'}" for i in session.history[-6:]
+def level_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Лайт", callback_data="level:light")],
+            [InlineKeyboardButton(text="🔥 Горячо", callback_data="level:hot")],
+            [InlineKeyboardButton(text="💣 Очень смело", callback_data="level:bold")],
+        ]
     )
-    prompt = f"""
-Ты — ведущий игры для пары. Язык — русский.
-Формат:
-- ответы «да», «нет», одно слово или медиа
-- 3 уровня (1 — лёгкий, 2 — средний, 3 — горячий)
-- без бывших и анала
 
-История (последние 6):
-{history_text or 'пусто'}
-Последний ответ: {last_answer or 'нет'}
-Текущий уровень: {level}
 
-Сгенерируй один вопрос для следующего игрока. Должно быть вежливо, но живо. Без нумерации, без пояснений.
-История: {history_text or 'нет'}
-Последний ответ: {last_answer or 'нет'}
-Сделай новый короткий вопрос для уровня {level} и учитывай предыдущие ответы.
-"""
+def length_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="10 вопросов", callback_data="len:10")],
+            [InlineKeyboardButton(text="15 вопросов", callback_data="len:15")],
+            [InlineKeyboardButton(text="20 вопросов", callback_data="len:20")],
+        ]
+    )
+
+
+def answer_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔥 Обожаю"), KeyboardButton(text="😳 Смущает, но ок")],
+            [KeyboardButton(text="❌ Пропустить вопрос")],
+            [KeyboardButton(text="➡️ Давай мягче"), KeyboardButton(text="⚡ Давай смелее")],
+            [KeyboardButton(text="🏁 Завершить игру")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def parse_names(text: str) -> tuple[str, str]:
+    parts = [p.strip() for p in text.replace(" и ", ",").split(",") if p.strip()]
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    return text.strip(), "Партнёр"
+
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    session_manager.finish(message.chat.id)
+    await state.clear()
+    await message.answer(
+        "Привет! Это игра для пары. Немного флирта, без грубостей и всё конфиденциально.\n"
+        "Напиши имена партнёров через запятую: например, <b>Аня, Сергей</b>.",
+    )
+    await state.set_state(SetupForm.waiting_names)
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await message.answer(
+        "Игра задаёт вопросы по очереди партнёрам.\n"
+        "Уровни: 💬 мягкий флирт, 🔥 горячо, 💣 очень смело.\n"
+        "Команды: /start — начать заново, /stop — завершить сессии с резюме."
+    )
+
+
+@dp.message(Command("stop"))
+async def cmd_stop(message: Message, state: FSMContext) -> None:
+    await finish_game(chat_id=message.chat.id, message=message)
+    await state.clear()
+
+
+@dp.message(SetupForm.waiting_names)
+async def get_names(message: Message, state: FSMContext) -> None:
+    partner1, partner2 = parse_names(message.text)
+    await state.update_data(partner1=partner1, partner2=partner2)
+    await message.answer(
+        f"Супер! Партнёры: {partner1} и {partner2}. Выберите уровень откровенности:",
+        reply_markup=level_keyboard(),
+    )
+    await state.set_state(SetupForm.waiting_level)
+
+
+@dp.callback_query(F.data.startswith("level:"), SetupForm.waiting_level)
+async def choose_level(callback: CallbackQuery, state: FSMContext) -> None:
+    level_value = callback.data.split(":", maxsplit=1)[1]
+    await state.update_data(level=IntimacyLevel(level_value))
+    await callback.message.edit_text("Отлично! Теперь выберите длину сессии:")
+    await callback.message.answer("Сколько вопросов сыграем?", reply_markup=length_keyboard())
+    await state.set_state(SetupForm.waiting_length)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("len:"), SetupForm.waiting_length)
+async def choose_length(callback: CallbackQuery, state: FSMContext) -> None:
+    length_value = int(callback.data.split(":", maxsplit=1)[1])
+    data = await state.get_data()
+    partner1 = data["partner1"]
+    partner2 = data["partner2"]
+    level = data["level"]
+
+    session = session_manager.get_or_create(
+        chat_id=callback.message.chat.id,
+        partner1_name=partner1,
+        partner2_name=partner2,
+        intimacy_level=level,
+        max_questions=length_value,
+    )
+    await state.set_state(SetupForm.playing)
+    await callback.message.answer(
+        f"Поехали! Уровень: {session.intimacy_level.label} {session.intimacy_level.emoji}. "
+        f"Всего вопросов: {session.max_questions}.",
+        reply_markup=answer_keyboard(),
+    )
+    await callback.answer()
+    await ask_next_question(callback.message.chat.id, callback.message)
+
+
+@dp.message(SetupForm.playing)
+async def handle_answer(message: Message, state: FSMContext) -> None:
+    text = message.text
+    if text == "❌ Пропустить вопрос":
+        await ask_next_question(message.chat.id, message, skipped=True)
+        return
+    if text == "➡️ Давай мягче":
+        session = session_manager.get(message.chat.id)
+        if session:
+            new_level = game_engine.next_level(session.intimacy_level, direction="down")
+            session_manager.update_level(message.chat.id, new_level)
+            await message.answer(f"Уровень снижен до: {new_level.label} {new_level.emoji}")
+        return
+    if text == "⚡ Давай смелее":
+        session = session_manager.get(message.chat.id)
+        if session:
+            new_level = game_engine.next_level(session.intimacy_level, direction="up")
+            session_manager.update_level(message.chat.id, new_level)
+            await message.answer(f"Уровень повышен до: {new_level.label} {new_level.emoji}")
+        return
+    if text == "🏁 Завершить игру":
+        await finish_game(chat_id=message.chat.id, message=message)
+        await state.clear()
+        return
+
+    game_engine.record_answer(message.chat.id, text)
+    await ask_next_question(message.chat.id, message)
+
+
+async def ask_next_question(chat_id: int, message: Message, skipped: bool = False) -> None:
+    session = session_manager.get(chat_id)
+    if not session:
+        await message.answer("Сессия не найдена. Нажмите /start, чтобы начать заново.")
+        return
+
+    if session.is_finished:
+        await finish_game(chat_id=chat_id, message=message)
+        return
+
+    if skipped:
+        game_engine.record_answer(chat_id, "Пропущено")
+
     try:
-        resp = await asyncio.to_thread(_gemini_model.generate_content, prompt)
-        text = resp.text.strip()
-        if text:
-            return text
-    except Exception as exc:  # pragma: no cover - сетевой код
-        logger.warning("Gemini question fallback because of %s", exc)
+        question = await ai_client.generate_question(session)
+    except Exception:
+        question = fallback_question(session)
 
-    fallback = {
-        1: "Какое ласковое слово тебе нравится больше всего?",
-        2: "Что бы ты хотел чаще слышать или чувствовать от партнёра?",
-        3: "Какое самое смелое желание ты бы хотел выполнить вместе?",
-    }
-    return fallback[level]
-        if text.startswith("1.") or text.startswith("1)"):
-            text = text[2:].strip()
-        return text
-    except Exception as exc:  # pragma: no cover - сетевой код
-        logger.warning("Gemini fallback because of %s", exc)
-        fallback = {
-            1: "Какое ласковое слово тебе нравится больше всего?",
-            2: "Ты бы хотел чаще говорить о своих желаниях?",
-            3: "Что самое смелое ты бы сделал ради партнёра?",
-        }
-        return fallback[level]
+    game_engine.add_question(chat_id, question)
+    await message.answer(question, reply_markup=answer_keyboard())
 
 
-async def generate_summary_ru(session: GameSession):
-    history_text = "\n".join(
-        f"{i.player_name}: {i.question} → {i.answer or 'нет ответа'}" for i in session.history
-    )
-    prompt = f"""
-Сделай короткое резюме игры двух людей ({session.player1} и {session.player2})
-по их ответам:
-{history_text}
-
-1. Дай тёплое заключение (2–3 предложения)
-2. Дай 3 коротких совета улучшения отношений
-3. Без морали и без упоминания бывших
-"""
+async def finish_game(chat_id: int, message: Message) -> None:
+    session = session_manager.finish(chat_id)
+    if not session:
+        await message.answer("Нет активной игры. Нажмите /start, чтобы начать.")
+        return
     try:
-        resp = await asyncio.to_thread(_gemini_model.generate_content, prompt)
-        return resp.text.strip()
-    except Exception as exc:  # pragma: no cover - сетевой код
-        logger.warning("Gemini summary fallback because of %s", exc)
-        return "Игра завершена! Вы отлично справились ❤️"
-
-
-async def send_rules(update: Update):
-    if update.message is None:
-        return
-    rules = (
-        "🔥 Love4Two — правила:\n"
-        "• Ответы: «да», «нет», одно слово или медиа.\n"
-        "• У каждого игрока 1 пропуск — команда /skip.\n"
-        "• 3 уровня: 1 — лёгкий флирт, 2 — средний, 3 — очень горячий.\n"
-        "• Без вопросов про бывших и анала.\n"
-        "• Вопросы по очереди, бот подстраивается под ответы.\n"
-        "• На ответ 60 секунд, потом бот напомнит."
-    )
-    await update.message.reply_text(rules)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message is None:
-        return
-    chat_id = update.effective_chat.id
-    session = get_session(chat_id)
-    session.reset()
-    context.chat_data["awaiting_name1"] = True
-    context.chat_data.pop("awaiting_name2", None)
-    await update.message.reply_text(
-        "🔥 Love4Two — игра для пары.\nНапиши имя первого игрока:"
+        summary = await ai_client.generate_summary(session)
+    except Exception:
+        summary = basic_summary(session)
+    await message.answer(
+        "🏁 Игра завершена! Вот мини-резюме:\n" + summary,
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="/start")]], resize_keyboard=True),
     )
 
 
-async def ask_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message is None:
-        return
-    chat_id = update.effective_chat.id
-    session = get_session(chat_id)
-    session.reset()
-    await update.message.reply_text(
-        "🔥 Love4Two — игра для пары.\nНапиши имя первого игрока:"
+def fallback_question(session: GameSession) -> str:
+    presets = [
+        "Расскажите, какой комплимент нравится каждому из вас больше всего?",
+        "Назовите место, где вы бы хотели устроить свидание вдвоём.",
+        "Что помогает вам быстрее расслабиться вместе?",
+        "Вспомните момент, когда вы чувствовали сильное доверие друг к другу.",
+    ]
+    idx = session.current_question_index % len(presets)
+    return presets[idx]
+
+
+def basic_summary(session: GameSession) -> str:
+    answered = [qa for qa in session.history if qa.answer]
+    return (
+        f"Вы прошли {len(answered)} вопросов из {session.max_questions}. "
+        "Судя по ответам, вам нравится исследовать друг друга и поддерживать доверие."
     )
-    context.user_data["awaiting_name1"] = True
-
-
-async def ask_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    session = get_session(chat_id)
-    name = (update.message.text or "").strip()
-
-    if context.chat_data.get("awaiting_name1"):
-        session.player1 = name or "Игрок 1"
-        context.chat_data["awaiting_name1"] = False
-        context.chat_data["awaiting_name2"] = True
-        await update.message.reply_text("Теперь имя второго игрока:")
-        return
-
-    if context.chat_data.get("awaiting_name2"):
-        session.player2 = name or "Игрок 2"
-        context.chat_data["awaiting_name2"] = False
-    if context.user_data.get("awaiting_name1"):
-        session.player1 = name
-        context.user_data["awaiting_name1"] = False
-        context.user_data["awaiting_name2"] = True
-        await update.message.reply_text("Теперь имя второго игрока:")
-        return
-
-    if context.user_data.get("awaiting_name2"):
-        session.player2 = name
-        context.user_data["awaiting_name2"] = False
-        await update.message.reply_text(
-            f"Отлично! {session.player1} и {session.player2}, давайте начнём.\nВведите /question."
-        )
-
-
-def _schedule_reminder(context: ContextTypes.DEFAULT_TYPE, session: GameSession) -> None:
-    if session.last_question_id is None or context.job_queue is None:
-    if not context.job_queue or session.last_question_id is None:
-        return
-
-    job_name = f"reminder-{session.chat_id}-{session.last_question_id}"
-    _cancel_reminder(context, session)
-
-    context.job_queue.run_once(
-        _reminder_job,
-        when=ANSWER_TIMEOUT,
-        chat_id=session.chat_id,
-        name=job_name,
-    )
-    session.reminder_job_name = job_name
-
-
-def _cancel_reminder(context: ContextTypes.DEFAULT_TYPE, session: GameSession) -> None:
-    if session.reminder_job_name and context.job_queue:
-        for job in context.job_queue.get_jobs_by_name(session.reminder_job_name):
-            job.schedule_removal()
-    session.reminder_job_name = None
-
-
-async def _reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    job = context.job
-    if job is None:
-        return
-    chat_id = job.chat_id
-    session = get_session(chat_id)
-    if session.waiting_for_answer and session.last_question_id is not None:
-        qa = session.history[session.last_question_id]
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"⏰ Напоминание! Ответ для {qa.player_name} на вопрос:\n"
-                f"{qa.question}\n\nНе затягивайте — просто 'да', 'нет' или одно слово."
-            ),
-        )
-
-
-async def cmd_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message is None:
-        return
-    chat_id = update.effective_chat.id
-    session = get_session(chat_id)
-
-    if not session.player1 or not session.player2:
-        await update.message.reply_text("Сначала напишите имена через /start.")
-        return
-
-    if session.waiting_for_answer:
-        await update.message.reply_text("Сначала ответьте на предыдущий вопрос!")
-        return
-
-    last_answer = session.history[-1].answer if session.history else None
-    question = await generate_question_ru(session.level, session, last_answer)
-
-    player = current_player_name(session)
-    qa = QAItem(player_name=player, level=session.level, question=question)
-    session.history.append(qa)
-    session.waiting_for_answer = True
-    session.last_question_id = len(session.history) - 1
-
-    await update.message.reply_text(
-        f"🎯 Вопрос для *{player}* (уровень {session.level}):\n\n{question}",
-        parse_mode="Markdown",
-    )
-    _schedule_reminder(context, session)
-
-
-async def cmd_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message is None:
-        return
-    chat_id = update.effective_chat.id
-    session = get_session(chat_id)
-
-    if not session.player1 or not session.player2:
-        await update.message.reply_text("Сначала напишите имена через /start.")
-        return
-
-    if context.args:
-        try:
-            new_level = int(context.args[0])
-        except ValueError:
-            await update.message.reply_text("Укажите уровень числом 1-3.")
-            return
-        session.level = max(MIN_LEVEL, min(MAX_LEVEL, new_level))
-        new_level = max(MIN_LEVEL, min(MAX_LEVEL, new_level))
-        session.level = new_level
-        await update.message.reply_text(f"Текущий уровень: {session.level}.")
-    else:
-        await update.message.reply_text(
-            f"Текущий уровень: {session.level}. Используйте /level 1|2|3 чтобы изменить."
-        )
-
-
-async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message is None:
-        return
-    chat_id = update.effective_chat.id
-    session = get_session(chat_id)
-
-    if not session.waiting_for_answer or session.last_question_id is None:
-        await update.message.reply_text("Нет активного вопроса. Введите /question.")
-        return
-
-    player_index = session.current_player_index
-    if session.skips_left[player_index] <= 0:
-        await update.message.reply_text("Пропуск уже израсходован.")
-        return
-
-    session.skips_left[player_index] -= 1
-    qa = session.history[session.last_question_id]
-    qa.skipped = True
-    qa.answer = "<пропуск>"
-    session.waiting_for_answer = False
-    next_player(session)
-    _cancel_reminder(context, session)
-
-    await update.message.reply_text("🛟 Пропуск принят. Введите /question для следующего.")
-
-
-async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message is None:
-        return
-    chat_id = update.effective_chat.id
-    session = get_session(chat_id)
-
-    if context.chat_data.get("awaiting_name1") or context.chat_data.get("awaiting_name2"):
-    chat_id = update.effective_chat.id
-    session = get_session(chat_id)
-
-    if context.user_data.get("awaiting_name1") or context.user_data.get("awaiting_name2"):
-        await ask_names(update, context)
-        return
-
-    if not session.waiting_for_answer or session.last_question_id is None:
-        await update.message.reply_text("Напиши /question для следующего вопроса.")
-        return
-
-    qa = session.history[session.last_question_id]
-    text = update.message.text or "<media>"
-    if not is_short_answer(text):
-        await update.message.reply_text("Ответ должен быть коротким.")
-        return
-
-    qa.answer = text.strip()
-    session.waiting_for_answer = False
-    _cancel_reminder(context, session)
-
-    normalized = qa.answer.lower()
-    if normalized.startswith("да"):
-        if session.level < MAX_LEVEL and random.random() < 0.7:
-            session.level += 1
-    elif normalized.startswith("нет"):
-        if session.level > MIN_LEVEL and random.random() < 0.3:
-            session.level -= 1
-
-    next_player(session)
-    await update.message.reply_text("✅ Ответ принят. Введите /question для следующего.")
-
-
-async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_rules(update)
-
-
-async def cmd_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message is None:
-        return
-    chat_id = update.effective_chat.id
-    session = get_session(chat_id)
-    summary = await generate_summary_ru(session)
-    await update.message.reply_text(summary)
-
-
-def main() -> None:
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-async def main():
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("rules", cmd_rules))
-    application.add_handler(CommandHandler("question", cmd_question))
-    application.add_handler(CommandHandler("level", cmd_level))
-    application.add_handler(CommandHandler("skip", cmd_skip))
-    application.add_handler(CommandHandler("finish", cmd_finish))
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_answer))
-
-    logger.info("Bot starting...")
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
-
-
-if __name__ == "__main__":
-    main()
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    await asyncio.Event().wait()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
