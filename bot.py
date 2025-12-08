@@ -10,6 +10,7 @@ import google.generativeai as genai
 from telegram import Update
 from telegram.ext import (
     Application,
+    ApplicationBuilder,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -114,6 +115,9 @@ async def generate_question_ru(level: int, session: GameSession, last_answer: st
 Текущий уровень: {level}
 
 Сгенерируй один вопрос для следующего игрока. Должно быть вежливо, но живо. Без нумерации, без пояснений.
+История: {history_text or 'нет'}
+Последний ответ: {last_answer or 'нет'}
+Сделай новый короткий вопрос для уровня {level} и учитывай предыдущие ответы.
 """
     try:
         resp = await asyncio.to_thread(_gemini_model.generate_content, prompt)
@@ -129,6 +133,17 @@ async def generate_question_ru(level: int, session: GameSession, last_answer: st
         3: "Какое самое смелое желание ты бы хотел выполнить вместе?",
     }
     return fallback[level]
+        if text.startswith("1.") or text.startswith("1)"):
+            text = text[2:].strip()
+        return text
+    except Exception as exc:  # pragma: no cover - сетевой код
+        logger.warning("Gemini fallback because of %s", exc)
+        fallback = {
+            1: "Какое ласковое слово тебе нравится больше всего?",
+            2: "Ты бы хотел чаще говорить о своих желаниях?",
+            3: "Что самое смелое ты бы сделал ради партнёра?",
+        }
+        return fallback[level]
 
 
 async def generate_summary_ru(session: GameSession):
@@ -185,6 +200,16 @@ async def ask_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     session = get_session(chat_id)
+    session.reset()
+    await update.message.reply_text(
+        "🔥 Love4Two — игра для пары.\nНапиши имя первого игрока:"
+    )
+    context.user_data["awaiting_name1"] = True
+
+
+async def ask_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    session = get_session(chat_id)
     name = (update.message.text or "").strip()
 
     if context.chat_data.get("awaiting_name1"):
@@ -197,6 +222,16 @@ async def ask_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.chat_data.get("awaiting_name2"):
         session.player2 = name or "Игрок 2"
         context.chat_data["awaiting_name2"] = False
+    if context.user_data.get("awaiting_name1"):
+        session.player1 = name
+        context.user_data["awaiting_name1"] = False
+        context.user_data["awaiting_name2"] = True
+        await update.message.reply_text("Теперь имя второго игрока:")
+        return
+
+    if context.user_data.get("awaiting_name2"):
+        session.player2 = name
+        context.user_data["awaiting_name2"] = False
         await update.message.reply_text(
             f"Отлично! {session.player1} и {session.player2}, давайте начнём.\nВведите /question."
         )
@@ -204,6 +239,7 @@ async def ask_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _schedule_reminder(context: ContextTypes.DEFAULT_TYPE, session: GameSession) -> None:
     if session.last_question_id is None or context.job_queue is None:
+    if not context.job_queue or session.last_question_id is None:
         return
 
     job_name = f"reminder-{session.chat_id}-{session.last_question_id}"
@@ -289,6 +325,8 @@ async def cmd_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Укажите уровень числом 1-3.")
             return
         session.level = max(MIN_LEVEL, min(MAX_LEVEL, new_level))
+        new_level = max(MIN_LEVEL, min(MAX_LEVEL, new_level))
+        session.level = new_level
         await update.message.reply_text(f"Текущий уровень: {session.level}.")
     else:
         await update.message.reply_text(
@@ -329,6 +367,10 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(chat_id)
 
     if context.chat_data.get("awaiting_name1") or context.chat_data.get("awaiting_name2"):
+    chat_id = update.effective_chat.id
+    session = get_session(chat_id)
+
+    if context.user_data.get("awaiting_name1") or context.user_data.get("awaiting_name2"):
         await ask_names(update, context)
         return
 
@@ -373,6 +415,8 @@ async def cmd_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main() -> None:
     application = Application.builder().token(TELEGRAM_TOKEN).build()
+async def main():
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("rules", cmd_rules))
@@ -391,3 +435,11 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    await asyncio.Event().wait()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
