@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: love-game-telegram
+    runtime: python
+    plan: free
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: AI_API_KEY
+        sync: false
+      - key: BASE_URL
+        sync: false
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}
+    env: python
+    autoDeploy: true
+    disk:
+      name: data
+      mountPath: /data
+    healthCheckPath: /health
