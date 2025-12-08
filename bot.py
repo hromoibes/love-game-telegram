@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 # Render previously installed python-telegram-bot 20.x on some deployments.
 # That version uses Updater internally and raises an AttributeError on Python 3.13
 # because of a missing __slots__ entry. Patch it defensively so both PTB 20.x and
-# 21.x work without crashing.
+# 21.x work without crashing. If __slots__ is still missing, fall back to wrapping
+# __init__ to avoid the crash entirely.
 try:  # pragma: no cover - compatibility shim for legacy PTB
     from telegram.ext._updater import Updater
 
@@ -36,6 +37,22 @@ try:  # pragma: no cover - compatibility shim for legacy PTB
         Updater.__slots__ = (*slots, _missing_slot)
     if not hasattr(Updater, _missing_slot):
         setattr(Updater, _missing_slot, None)
+
+    # Some python-telegram-bot 20.x builds still error even after slot injection
+    # on Python 3.13. Wrap __init__ to force-set the attribute before the base
+    # implementation runs.
+    _orig_init = getattr(Updater, "__init__", None)
+    if callable(_orig_init) and not getattr(Updater, "_patched_polling_cleanup", False):
+
+        def _safe_init(self, *args, **kwargs):
+            try:
+                object.__setattr__(self, _missing_slot, None)
+            except Exception:
+                pass
+            _orig_init(self, *args, **kwargs)
+
+        Updater.__init__ = _safe_init
+        Updater._patched_polling_cleanup = True
 except Exception:  # pragma: no cover - best-effort guard only
     logger.warning("Updater slot patch skipped; PTB may be >=21 or already patched")
 
